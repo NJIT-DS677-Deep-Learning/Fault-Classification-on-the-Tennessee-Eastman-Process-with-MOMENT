@@ -1,6 +1,6 @@
 # Data
 
-Place the four TEP CSV files from [Kaggle](https://www.kaggle.com/datasets/afrniomelo/tep-csv) within this data/ folder. They are ignored by git
+Place the four TEP CSV files from [Kaggle](https://www.kaggle.com/datasets/afrniomelo/tep-csv) within this 'data/' folder. They are ignored by git
 
 | File                       | Runs                      | Samples per run  | Fault starts after sample |
 | TEP_FaultFree_Training.csv | 500                       | 500              | none |
