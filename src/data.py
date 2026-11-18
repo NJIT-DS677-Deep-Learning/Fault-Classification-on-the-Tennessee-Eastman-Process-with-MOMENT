@@ -9,128 +9,66 @@ Key facts about the data:
   so splits must always be made by run number, the same way in every file.
 """
 
-from __future__ import annotations
+"""Load and prepare the extended TEP dataset (Rieth et al., 2017)."""
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
-
 import numpy as np
 import pandas as pd
 
 SENSORS = [f"xmeas_{i}" for i in range(1, 42)] + [f"xmv_{i}" for i in range(1, 12)]
-ID_COLS = ["faultNumber", "simulationRun", "sample"]
-N_RUNS = 500
-N_CLASSES = 21  # 0 = normal, 1-20 = faults
-FAULT_ONSET = {"train": 20, "test": 160}  # last normal sample in each run
+# The fault is switched on after this sample in every run
+FAULT_START = {"train": 20, "test": 160}
 
 FILES = {
-    ("train", "normal"): "TEP_FaultFree_Training.csv",
-    ("train", "faulty"): "TEP_Faulty_Training.csv",
-    ("test", "normal"): "TEP_FaultFree_Testing.csv",
-    ("test", "faulty"): "TEP_Faulty_Testing.csv",
+    "train": ("TEP_FaultFree_Training.csv", "TEP_Faulty_Training.csv"),
+    "test": ("TEP_FaultFree_Testing.csv", "TEP_Faulty_Testing.csv"),
 }
 
-
-def _read_filtered(path: Path, runs: set[int], faults: set[int] | None,
-                   chunksize: int = 500_000) -> pd.DataFrame:
-    """Read only the requested runs (and faults) from a large CSV, in chunks."""
-    dtypes = {c: np.float32 for c in SENSORS}
-    dtypes.update({"faultNumber": np.int16, "simulationRun": np.int16, "sample": np.int16})
+def read_runs(path, runs):
+    """Read only the chosen simulation runs from a large CSV, in chunks."""
     parts = []
-    for chunk in pd.read_csv(path, dtype=dtypes, chunksize=chunksize):
-        mask = chunk["simulationRun"].isin(runs)
-        if faults is not None:
-            mask &= chunk["faultNumber"].isin(faults)
-        if mask.any():
-            parts.append(chunk.loc[mask])
-    if not parts:
-        return pd.DataFrame(columns=ID_COLS + SENSORS)
+    for chunk in pd.read_csv(path, chunksize=500_000):
+        parts.append(chunk[chunk["simulationRun"].isin(runs)])
     return pd.concat(parts, ignore_index=True)
 
+def load_split(data_dir, split, runs):
+    """Load fault-free and faulty runs for 'train' or 'test' and add labels.
 
-def load_split(data_dir: str | Path, split: str, runs: Iterable[int],
-               faults: Iterable[int] = range(N_CLASSES)) -> pd.DataFrame:
-    """Load the given runs for the given faults from the train or test files.
-
-    Adds a `label` column: the fault number after the fault starts, 0 before it.
+    label = 0 before the fault starts, otherwise the fault number.
     """
-    if split not in FAULT_ONSET:
-        raise ValueError("split must be 'train' or 'test'")
-    data_dir = Path(data_dir)
-    runs = set(int(r) for r in runs)
-    faults = set(int(f) for f in faults)
+    normal_file, faulty_file = FILES[split]
+    df = pd.concat([
+        read_runs(Path(data_dir) / normal_file, runs),
+        read_runs(Path(data_dir) / faulty_file, runs),
+    ], ignore_index=True)
 
-    frames = []
-    if 0 in faults:
-        frames.append(_read_filtered(data_dir / FILES[(split, "normal")], runs, {0}))
-    faulty = faults - {0}
-    if faulty:
-        frames.append(_read_filtered(data_dir / FILES[(split, "faulty")], runs, faulty))
+    df["label"] = np.where(df["sample"] > FAULT_START[split], df["faultNumber"], 0)
+    return df
 
-    df = pd.concat(frames, ignore_index=True)
-    onset = FAULT_ONSET[split]
-    df["label"] = np.where(df["sample"] > onset, df["faultNumber"], 0).astype(np.int16)
-    return df.sort_values(ID_COLS, ignore_index=True)
-
-
-def split_runs(seed: int = 0, n_val: int = 50) -> tuple[np.ndarray, np.ndarray]:
-    """Shuffle training run numbers once and hold out `n_val` runs for validation.
-
-    Returns (train_pool, val_runs). The same run numbers are used for every fault.
-    """
+def split_runs(seed=0, n_val=50):
+    """Shuffle run numbers 1-500 and hold some out for validation."""
     rng = np.random.default_rng(seed)
-    order = rng.permutation(np.arange(1, N_RUNS + 1))
-    return order[n_val:], order[:n_val]
+    runs = rng.permutation(np.arange(1, 501))
+    return runs[n_val:], runs[:n_val]  # train_pool, val_runs
 
+def subset(train_pool, pct):
+    """Take the first pct% of the pool, so smaller subsets sit inside larger ones."""
+    k = max(1, round(len(train_pool) * pct / 100))
+    return train_pool[:k]
 
-def nested_subset(train_pool: Sequence[int], pct: float) -> np.ndarray:
-    """First `pct` percent of the shuffled pool, so smaller subsets sit inside larger ones."""
-    k = max(1, int(round(len(train_pool) * pct / 100)))
-    return np.asarray(train_pool[:k])
+def fit_scaler(df):
+    """Mean and std of each sensor, using normal data only."""
+    normal = df.loc[df["label"] == 0, SENSORS]
+    return normal.mean().to_numpy(), normal.std().replace(0, 1).to_numpy()
 
-
-@dataclass
-class Scaler:
-    mean: np.ndarray
-    std: np.ndarray
-
-    @classmethod
-    def fit(cls, df: pd.DataFrame) -> "Scaler":
-        """Fit on normal-operation rows only (label 0)."""
-        x = df.loc[df["label"] == 0, SENSORS].to_numpy(np.float64)
-        std = x.std(axis=0)
-        std[std == 0] = 1.0
-        return cls(x.mean(axis=0).astype(np.float32), std.astype(np.float32))
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        return ((x - self.mean) / self.std).astype(np.float32)
-
-
-def make_windows(df: pd.DataFrame, scaler: Scaler, window: int = 64,
-                 stride: int = 8) -> dict[str, np.ndarray]:
-    """Cut each run into sliding windows that end at time t (no peeking ahead).
-
-    Each window gets the label of its last sample.
-    Returns X with shape (n_windows, 52, window) plus labels and run metadata.
-    """
-    xs, ys, faults, runs, ends = [], [], [], [], []
-    for (fault, run), g in df.groupby(["faultNumber", "simulationRun"], sort=True):
-        x = scaler.transform(g[SENSORS].to_numpy(np.float32))
-        lab = g["label"].to_numpy()
-        smp = g["sample"].to_numpy()
-        for end in range(window - 1, len(g), stride):
-            xs.append(x[end - window + 1:end + 1].T)
-            ys.append(lab[end])
-            faults.append(fault)
-            runs.append(run)
-            ends.append(smp[end])
-    if not xs:
-        raise ValueError("No windows created: runs are shorter than the window length")
-    return {
-        "X": np.stack(xs).astype(np.float32),
-        "y": np.asarray(ys, dtype=np.int64),
-        "fault": np.asarray(faults, dtype=np.int16),
-        "run": np.asarray(runs, dtype=np.int16),
-        "end_sample": np.asarray(ends, dtype=np.int16),
-    }
+def make_windows(df, mean, std, window=64, stride=8):
+    """Cut each run into windows that end at time t. Each window gets the label of its last sample."""
+    X, y = [], []
+    for _, run in df.groupby(["faultNumber", "simulationRun"]):
+        run = run.sort_values("sample")
+        values = ((run[SENSORS].to_numpy() - mean) / std).astype(np.float32)
+        labels = run["label"].to_numpy()
+        for end in range(window - 1, len(run), stride):
+            X.append(values[end - window + 1:end + 1].T)  # shape: (52 sensors, window)
+            y.append(labels[end])
+    return np.stack(X), np.array(y)
